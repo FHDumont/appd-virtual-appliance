@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+#shellcheck disable=SC1091,SC1090
+source config.cfg
+POOL="${STORAGE_POOL}"
+VM_PREFIX=${1-"${VM_HOSTNAME_PREFIX}"}
+if [ -n "${1}" ]; then
+    if [ -s "${1}" ]; then
+        echo "reading config $1..."
+
+        source "${1}"
+        export VM_PREFIX="${VM_HOSTNAME_PREFIX}"
+    fi
+    shift;
+fi
+if [ -z "$VM_PREFIX" ]; then
+    echo "error: invalid VM Name prefix.  $0 [<VMName Prefix> | <cluster config file>]"
+    exit 1
+fi
+
+# allow expansion
+#shellcheck disable=SC2206
+all_nodes=( "${LIBVIRT_HOST_SELF}" ${LIBVIRT_HOST_PEERS[@]} )
+for node in "${all_nodes[@]}"; do
+    echo "> --- ${node} --- <"
+    vuri="qemu+ssh://${node}/system"
+    echo "> showing storage volumes on node '$node' pool '$POOL'..."
+    virsh -c "$vuri" vol-list "$POOL"
+    echo "> removing storage volumes named '${VM_PREFIX}' on node '$node' pool '$POOL'..."
+    virsh -c "$vuri" vol-list "$POOL"  | awk "/${VM_PREFIX}[0-9]/ {print \$1}" | xargs -I{} virsh -c "$vuri" vol-delete --pool "$POOL" {}
+    if [ "$1"  = "templates" ]; then
+        echo "> removing storage volume template named 'template-${VM_PREFIX}' on node '$node' pool '$POOL'..."
+        virsh -c "$vuri" vol-list "$POOL"  | awk "/template-appd-va/ {print \$1}" | xargs -I{} virsh -c "$vuri" vol-delete --pool "$POOL" {}
+    fi
+    echo
+done

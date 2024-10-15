@@ -1,0 +1,21 @@
+#!/usr/bin/env  bash
+#shellcheck disable=SC1091,SC1090,SC2206
+
+set -o pipefail
+
+### Config ###
+# shellcheck source-path=SCRIPTDIR
+source config.cfg
+source libvirt.sh
+#############
+
+if [ -n "${1}" ]; then
+    if [ -f "${1}" ]; then
+        echo "reading config $1..."
+        source "${1}"
+    else
+       VM_HOSTNAME_PREFIX="${1}"
+       export VM_HOSTNAME_PREFIX
+    fi
+fi
+show_cluster_status

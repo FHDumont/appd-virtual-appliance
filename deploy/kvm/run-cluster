@@ -1,0 +1,173 @@
+#!/usr/bin/env  bash
+#shellcheck disable=SC1091
+
+set -o pipefail
+
+# import config and libvirt library
+source config.cfg
+source libvirt.sh
+
+usage() {
+    echo "$0 <path to AppD VA OnPrem qcow2 image> [<cluster config file>]"
+    exit 1
+}
+
+# assume hypervisor setup is complete
+# for each node in config:
+#   - configure virsh connections
+#   - configure storage
+#   - import qcow2 -> raw
+#   - create VM with cloud-init iso via virt-install
+#
+# print cluster status info including VM node, VM IP, VM Hostname
+main() {
+    local all_nodes node priv_key src_qcow2
+
+    if [ -z "$1" ] ; then
+        echo "error: missing required parameter Source QCOW2 file path"
+        usage
+    fi
+
+    if [ ! -s "$1" ] ; then
+        echo "error: bad source qcow2 file '$1' is empty"
+        usage
+    fi
+
+    if [ -n "${2}" ]; then
+        if [ -s "${2}" ]; then
+            echo "reading config $2 ..."
+            #shellcheck disable=SC1090
+            source "${2}"
+        fi
+    fi
+
+    src_qcow2=$(realpath "${1}")
+    output_raw="${src_qcow2%*.qcow2}.raw"
+    template_img="template-$(basename "${output_raw}")"
+
+    # allow expansion
+    #shellcheck disable=SC2206
+    all_nodes=( "${LIBVIRT_HOST_SELF}" ${LIBVIRT_HOST_PEERS[@]} )
+
+    priv_key="/home/${USER}/.ssh/appdva_id_ed25519"
+    if ! [ -s "${priv_key}" ]; then
+        echo "error: expected AppD VA ssh keypair missing '$priv_key'"
+        echo "error: please ensure '01-prepare-hypervisory.sh' has been run on all KVM cluster hosts first"
+        return 1
+    fi
+
+    # check virsh connections
+    for node in "${all_nodes[@]}"; do
+        if ! check_virsh_connection "$node"; then
+            # maybe first time, if so, replicate pub key to node
+            if  ! copy_pubkey_to_node "${priv_key}" "${node}"; then
+                echo "error: failed to copy ssh pub key to node '${node}'"
+                return 1
+            fi
+            if ! check_virsh_connection "$node"; then
+                echo "error: virsh connection to node '$node' failed"
+                return 1
+            fi
+        fi
+    done
+
+    # copy peer's pubkey to self
+    for peer in "${LIBVIRT_HOST_PEERS[@]}"; do
+        echo "> copying ${peer} ssh pubkey to node ${LIBVIRT_HOST_SELF} ..."
+        if ! copy_peer_pubkey_to_self "${priv_key}" "${peer}" "$USER@${LIBVIRT_HOST_SELF}"; then
+            echo "error: failed to copy peer:${peer} 's pub key to node '${LIBVIRT_HOST_SELF}'"
+            return 1
+        fi
+    done
+
+    # check and configure storage if needed
+    for node in "${all_nodes[@]}"; do
+        if ! create_storage_pool "${node}" "${STORAGE_POOL}" "${STORAGE_PATH}"; then
+            echo "error: failed to create/verify storage pool '${STORAGE_POOL}' on node ${node}"
+            return 1
+        fi
+    done
+
+    # convert to raw
+    if ! [ -s "${output_raw}" ]; then
+        if ! convert_qcow2_to_raw "${src_qcow2}" "${output_raw}"; then
+            echo "error: failed to convert qcow2 '${src_qcow2}' to raw '${output_raw}'"
+            return 1
+        fi
+    else
+        echo "> using existing raw file '${output_raw}'"
+    fi
+
+    # create template image on each node, create OS disk for each VM
+    #template_img
+    for node in "${all_nodes[@]}"; do
+        if ! create_template_image "${node}" "${STORAGE_POOL}" "${output_raw}" "${template_img}"; then
+            echo "error: failed to create template image with '$output_raw' on '${node}/${STORAGE_POOL}'"
+            return 1
+        fi
+    done
+
+    # for each VM we create, we need to clone the template on the node we want
+    # to deploy the VM; templates are on each node already
+    echo "> provisioning disks for VMs on nodes ...."
+    local vm_id vm_name node_id tnode os_disk_name data_disk_name data_disk_fmt
+    for ((v=0; v<NUM_VMS; v++)); do
+        # we number vms starting from 1 (vm1, vm2, etc)
+        vm_id=$((v+1))
+        vm_name=${VM_HOSTNAME_PREFIX}${vm_id}
+
+        # we index the node array by 0, and if we allocate more VMs than
+        # nodes, we need to spread the VMs evenly across the nodes
+        node_id=$((v % NUM_VMS))
+        tnode=${all_nodes[$node_id]}
+        vm_cidr=${VM_CIDRS[$node_id]}
+
+        os_disk_name=${vm_name}-os-disk
+        if ! clone_and_resize "${tnode}" "${STORAGE_POOL}" "${template_img}" "${os_disk_name}" "${VM_OS_DISK_GB}"; then
+            echo "error: failed to clone template image on node and resize"
+            return 1
+        fi
+
+        data_disk_name=${vm_name}-data-disk
+        data_disk_fmt="raw"
+        if ! create_disk "${tnode}" "${STORAGE_POOL}" "${data_disk_name}" "${VM_DATA_DISK_GB}" "$data_disk_fmt"; then
+            echo "error: failed to create data disk on node '${node}' in pool '${STOARGE_POOL}' size '${VM_DATA_DISK_GB}G'"
+            return 1
+        fi
+
+        # create VM's cloudconfig iso
+        cc_args=( "${tnode}" "${STORAGE_POOL}" "${vm_name}" "${vm_cidr}" "${VM_GATEWAY}" "${VM_DNS}" )
+        if ! create_vm_cloudconfig "${cc_args[@]}"; then
+            echo "error: failed to create cloud-init configuration ISO for ${vm_name} on ${tnode}"
+            return 1
+        fi
+
+        # cc iso is uploaded to ${tnode}'s ${STORAGE_POOL} and available at
+        # ${tnode} localpath of ${STORAGE_PATH}
+        cc_iso_vol="${STORAGE_PATH}/${vm_name}-cidata.iso"
+
+        # find which numa node to align VM memory/cpus
+        numa_node=$(find_next_numa_node "$tnode")
+        #shellcheck disable=SC2181
+        if [ "$?" != "0" ]; then
+            echo "error: failed to find next numa node to use on node '$tnode'"
+            return 1
+        fi
+
+        # launch the VM
+        launch_args=(
+            "${tnode}" "${STORAGE_POOL}" "${vm_name}" "${os_disk_name}"
+            "${data_disk_name}" "${VM_VCPUS}" "${VM_MEMORY_GB}"
+            "${numa_node}" "${BRIDGE_NAME}" "${cc_iso_vol}"
+        )
+        if ! launch_vm "${launch_args[@]}"; then
+            echo "error: failed to launch VM '$vm_name' on node '$node'"
+            return 1
+        fi
+
+    done
+
+    show_cluster_status
+}
+
+main "$@"

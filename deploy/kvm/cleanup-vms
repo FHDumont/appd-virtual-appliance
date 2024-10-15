@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+#shellcheck disable=SC1091,SC1090
+source config.cfg
+VM_PREFIX=${1-"${VM_HOSTNAME_PREFIX}"}
+if [ -n "${1}" ]; then
+    if [ -s "${1}" ]; then
+        echo "reading config $1..."
+
+        source "${1}"
+        export VM_PREFIX="${VM_HOSTNAME_PREFIX}"
+    fi
+fi
+if [ -z "$VM_PREFIX" ]; then
+    echo "error: invalid VM Name prefix.  $0 [<VMName Prefix> | <cluster config file>]"
+    exit 1
+fi
+
+# allow expansion
+#shellcheck disable=SC2206
+all_nodes=( "${LIBVIRT_HOST_SELF}" ${LIBVIRT_HOST_PEERS[@]} )
+for node in "${all_nodes[@]}"; do
+    echo "> --- ${node} --- <"
+    echo "> showing vms on node '$node' ..."
+    virsh -c "$vuri" list --all
+    echo "> removing VMs named '${VM_PREFIX}' on node '$node' ..."
+    vuri="qemu+ssh://${node}/system"
+    virsh -c "$vuri" list --all | awk "/${VM_PREFIX}/ {print \$2}" | xargs -I{} virsh -c "$vuri" destroy {}
+    virsh -c "$vuri" list --all | awk "/${VM_PREFIX}/ {print \$2}" | xargs -I{} virsh -c "$vuri" undefine --nvram  {}
+done
