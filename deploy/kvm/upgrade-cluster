@@ -1,0 +1,95 @@
+#!/usr/bin/env  bash
+#shellcheck disable=SC1091
+
+set -o pipefail
+
+# import config and libvirt library
+source config.cfg
+source libvirt.sh
+
+usage() {
+    echo "$0 <path to AppD VA OnPrem qcow2 image> [<cluster config file>]"
+    exit 1
+}
+
+# assume hypervisor setup is complete
+# for each node in config:
+#   - configure virsh connections
+#   - configure storage
+#   - import qcow2 -> raw
+#   - create VM with cloud-init iso via virt-install
+#
+# print cluster status info including VM node, VM IP, VM Hostname
+main() {
+    local all_nodes node priv_key src_qcow2
+
+    if [ -z "$1" ] ; then
+        echo "error: missing required parameter Source QCOW2 file path"
+        usage
+    fi
+
+    if [ ! -s "$1" ] ; then
+        echo "error: bad source qcow2 file '$1' is empty"
+        usage
+    fi
+
+    if [ -n "${2}" ]; then
+        if [ -s "${2}" ]; then
+            echo "reading config $2 ..."
+            #shellcheck disable=SC1090
+            source "${2}"
+        fi
+    fi
+
+    src_qcow2=$(realpath "${1}")
+    output_raw="${src_qcow2%*.qcow2}.raw"
+    template_img="template-$(basename "${output_raw}")"
+
+    # allow expansion
+    #shellcheck disable=SC2206
+    all_nodes=( "${LIBVIRT_HOST_SELF}" ${LIBVIRT_HOST_PEERS[@]} )
+
+    priv_key="/home/${USER}/.ssh/appdva_id_ed25519"
+    if ! [ -s "${priv_key}" ]; then
+        echo "error: expected AppD VA ssh keypair missing '$priv_key'"
+        echo "error: please ensure '01-prepare-hypervisory.sh' has been run on all KVM cluster hosts first"
+        return 1
+    fi
+
+    # check virsh connections
+    for node in "${all_nodes[@]}"; do
+        if ! check_virsh_connection "$node"; then
+            if ! check_virsh_connection "$node"; then
+                echo "error: virsh connection to node '$node' failed"
+                return 1
+            fi
+        fi
+    done
+
+    # check and configure storage if needed
+    for node in "${all_nodes[@]}"; do
+        if ! create_storage_pool "${node}" "${STORAGE_POOL}" "${STORAGE_PATH}"; then
+            echo "error: failed to create/verify storage pool '${STORAGE_POOL}' on node ${node}"
+            return 1
+        fi
+    done
+
+    # convert to raw
+    if ! [ -s "${output_raw}" ]; then
+        if ! convert_qcow2_to_raw "${src_qcow2}" "${output_raw}"; then
+            echo "error: failed to convert qcow2 '${src_qcow2}' to raw '${output_raw}'"
+            return 1
+        fi
+    else
+        echo "> using existing raw file '${output_raw}'"
+    fi
+
+    if ! upgrade_cluster "$output_raw" "${template_img}" "${VM_CLUSTER_NAME}" "$STORAGE_POOL" "${VM_OS_DISK_GB}"; then
+        echo "error: failed to upgrade cluster '${VM_CLUSTER_NAME}'"
+        return 1
+    fi
+
+    show_cluster_status
+}
+
+main "$@"
