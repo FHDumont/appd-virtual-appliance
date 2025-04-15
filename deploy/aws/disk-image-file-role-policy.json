@@ -1,8 +1,3 @@
-#!/usr/bin/env bash
-
-source config.cfg
-
-cat > disk-image-file-role-policy.json << EOF
 {
    "Version":"2012-10-17",
    "Statement":[
@@ -14,8 +9,8 @@ cat > disk-image-file-role-policy.json << EOF
             "s3:ListBucket"
          ],
          "Resource": [
-            "arn:aws:s3:::${IMAGE_IMPORT_BUCKET}",
-            "arn:aws:s3:::${IMAGE_IMPORT_BUCKET}/*"
+            "arn:aws:s3:::appd-va-bucket-v2",
+            "arn:aws:s3:::appd-va-bucket-v2/*"
          ]
       },
       {
@@ -30,8 +25,3 @@ cat > disk-image-file-role-policy.json << EOF
      }
    ]
 }
-EOF
-
-aws --profile ${AWS_PROFILE} iam put-role-policy \
-    --role-name vmimport --policy-name vmimport \
-    --policy-document "file://disk-image-file-role-policy.json"

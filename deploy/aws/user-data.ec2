@@ -1,0 +1,7 @@
+#cloud-config
+ssh_pwauth: True
+appdos:
+  bootstrap:
+    netplan:
+      dhcp4: true
+      dhcp6: false
